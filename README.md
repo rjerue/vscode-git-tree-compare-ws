@@ -56,4 +56,8 @@ By default, the tree view is located in its own container accessible from the ac
 
 `gitTreeCompare.compactFolders` When enabled, compacts (flattens) single-child folders into a single tree element. Useful for Java package structures, for example. May have a performance impact for large diff trees.
 
+`gitTreeCompare.showCheckboxes` When enabled, shows checkboxes next to files and folders, allowing you to tick off items, for example when reviewing changes.
+
+`gitTreeCompare.resetCheckboxOnFileChange` When enabled, automatically resets a file's checkbox when the file is modified after being checked. This ensures that checked files reflect their reviewed state, and any subsequent modifications require re-review. Only effective when `showCheckboxes` is enabled.
+
 `gitTreeCompare.refSortOrder` Determines how refs (branches, tags) are sorted when changing the comparison base. Default is `committerdate` which sorts by most recently committed first, making it easy to find recently-used branches. Can be set to `alphabetically` for alphabetical sorting.

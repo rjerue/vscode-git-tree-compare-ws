@@ -17,6 +17,11 @@ import { debounce, throttle } from './git/decorators'
 import { normalizePath } from './fsUtils';
 import { API as GitAPI, Repository as GitAPIRepository } from './typings/git';
 
+interface CheckboxStateInfo {
+    state: TreeItemCheckboxState;
+    timestamp: number; // When the checkbox was checked
+}
+
 class FileElement implements IDiffStatus {
     constructor(
         public srcAbsPath: string,
@@ -104,6 +109,7 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     private showCollapsed: boolean;
     private compactFolders: boolean;
     private showCheckboxes: boolean;
+    private resetCheckboxOnFileChange: boolean;
 
     // Dynamic options
     private repository: Repository | undefined;
@@ -133,7 +139,7 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     // UI state
     private treeView: TreeView<Element>;
     private isPaused: boolean;
-    private checkboxStates: Map<string, TreeItemCheckboxState> = new Map<string, TreeItemCheckboxState>();
+    private checkboxStates: Map<string, CheckboxStateInfo> = new Map<string, CheckboxStateInfo>();
 
     // Other
     private readonly disposables: Disposable[] = [];
@@ -307,7 +313,10 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     private async handleChangeCheckboxState(e: TreeCheckboxChangeEvent<Element>) {
         for (let [element, state] of e.items) {
             if (element instanceof FileElement || element instanceof FolderElement) {
-                this.checkboxStates.set(element.dstAbsPath, state);
+                this.checkboxStates.set(element.dstAbsPath, {
+                    state: state,
+                    timestamp: Date.now()
+                });
             }
         }
     }
@@ -344,6 +353,7 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
         this.showCollapsed = config.get<boolean>('collapsed', false);
         this.compactFolders = config.get<boolean>('compactFolders', false);
         this.showCheckboxes = config.get<boolean>('showCheckboxes', false);
+        this.resetCheckboxOnFileChange = config.get<boolean>('resetCheckboxOnFileChange', false);
     }
 
     private async getStoredBaseRef(): Promise<string | undefined> {
@@ -381,11 +391,45 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     getTreeItem(element: Element): TreeItem {
         let checkboxState: TreeItemCheckboxState | undefined;
         if (this.showCheckboxes) {
-            if (element instanceof FileElement || element instanceof FolderElement) {
-                checkboxState = this.checkboxStates.get(element.dstAbsPath) ?? TreeItemCheckboxState.Unchecked;
+            if (element instanceof FileElement) {
+                const stateInfo = this.checkboxStates.get(element.dstAbsPath);
+                checkboxState = stateInfo?.state ?? TreeItemCheckboxState.Unchecked;
+            } else if (element instanceof FolderElement) {
+                // Compute folder state from children: checked if all children are checked
+                checkboxState = this.computeFolderCheckboxState(element);
             }
         }
         return toTreeItem(element, this.openChangesOnSelect, this.iconsMinimal, this.showCollapsed, this.viewAsList, checkboxState, this.asAbsolutePath);
+    }
+
+    private computeFolderCheckboxState(folder: FolderElement): TreeItemCheckboxState {
+        // Check if user explicitly set state on this folder
+        const explicitState = this.checkboxStates.get(folder.dstAbsPath);
+        if (explicitState) {
+            return explicitState.state;
+        }
+        
+        // Otherwise derive from files: folder is checked only if ALL files under it are checked
+        const files = folder.useFilesOutsideTreeRoot ? this.filesOutsideTreeRoot : this.filesInsideTreeRoot;
+        let hasFiles = false;
+        let allChecked = true;
+        
+        for (const [folderPath, fileEntries] of files.entries()) {
+            // Check if this folder is under the target folder
+            if (folderPath === folder.dstAbsPath || folderPath.startsWith(folder.dstAbsPath + path.sep)) {
+                for (const file of fileEntries) {
+                    hasFiles = true;
+                    const stateInfo = this.checkboxStates.get(file.dstAbsPath);
+                    if (!stateInfo || stateInfo.state !== TreeItemCheckboxState.Checked) {
+                        allChecked = false;
+                        break;
+                    }
+                }
+                if (!allChecked) break;
+            }
+        }
+        
+        return (hasFiles && allChecked) ? TreeItemCheckboxState.Checked : TreeItemCheckboxState.Unchecked;
     }
 
     async getChildren(element?: Element): Promise<Element[]> {
@@ -510,6 +554,10 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
         const untrackedCount = diff.reduce((prev, cur, _) => prev + (cur.status === 'U' ? 1 : 0), 0);
         this.log(`${diff.length} diff entries (${untrackedCount} untracked)`);
 
+        const newFilePaths = new Set<string>();
+        // Collect files that need mtime checking for async batch processing
+        const filesToCheckMtime: Array<{filePath: string, stateInfo: CheckboxStateInfo}> = [];
+        
         for (const entry of diff) {
             const folder = path.dirname(entry.dstAbsPath);
 
@@ -532,6 +580,57 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
 
             const entries = files.get(folder)!;
             entries.push(entry);
+
+            // Track new file paths
+            newFilePaths.add(entry.dstAbsPath);
+            
+            // Collect checked files for mtime checking to reset if modified after being checked
+            if (this.resetCheckboxOnFileChange) {
+                const stateInfo = this.checkboxStates.get(entry.dstAbsPath);
+                if (stateInfo && stateInfo.state === TreeItemCheckboxState.Checked) {
+                    filesToCheckMtime.push({filePath: entry.dstAbsPath, stateInfo});
+                }
+            }
+        }
+
+        // Check file modification times asynchronously in parallel
+        if (this.resetCheckboxOnFileChange && filesToCheckMtime.length > 0) {
+            const statPromises = filesToCheckMtime.map(async ({filePath, stateInfo}) => {
+                try {
+                    const stats = await fs.promises.stat(filePath);
+                    const fileMtime = stats.mtimeMs;
+                    
+                    // If file was modified after checkbox was checked, reset it
+                    if (fileMtime > stateInfo.timestamp) {
+                        return filePath;
+                    }
+                } catch (error: unknown) {
+                    // File might be deleted or inaccessible - this is expected in some cases
+                    const errorMessage = error instanceof Error ? error.message : String(error);
+                    this.log(`Could not stat file for checkbox reset check: ${filePath}: ${errorMessage}`);
+                }
+                return null;
+            });
+            
+            const pathsToReset = await Promise.all(statPromises);
+            const actualPathsToReset = pathsToReset.filter((filePath): filePath is string => filePath !== null);
+            actualPathsToReset.forEach(filePath => this.checkboxStates.delete(filePath));
+            
+            // Fire tree refresh to update checkbox UI
+            if (actualPathsToReset.length > 0) {
+                this._onDidChangeTreeData.fire();
+            }
+        }
+
+        // Clear checkbox state for files that no longer exist in the diff
+        const pathsToDelete: string[] = [];
+        for (const [filePath] of this.checkboxStates) {
+            if (!newFilePaths.has(filePath)) {
+                pathsToDelete.push(filePath);
+            }
+        }
+        for (const filePath of pathsToDelete) {
+            this.checkboxStates.delete(filePath);
         }
 
         let treeHasChanged = false;
