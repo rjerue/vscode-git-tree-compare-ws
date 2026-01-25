@@ -12,6 +12,8 @@ In bigger projects with many files it also provides **context**, it gives you a 
 
 - Working tree comparison against any chosen branch, tag, or commit
 
+- Compare GitHub Pull Requests
+
 - Switch between tree and list view
 
 - Compare in merge or full mode
@@ -33,6 +35,22 @@ In bigger projects with many files it also provides **context**, it gives you a 
 By default, the tree view is located in its own container accessible from the activity bar on the left. However, it can be freely moved to any other location like Source Control or Explorer by dragging and dropping.
 
 <img src="screenshots/move-view.gif" alt="Moving of Git Tree Compare view between containers" width="256" />
+
+## Compare GitHub Pull Requests
+
+You can quickly view GitHub PR changes directly in VS Code using the **Compare GitHub Pull Request** command:
+
+1. Click the "..." menu button in the Git Tree Compare view title bar
+2. Select **Compare GitHub Pull Request...**
+3. Enter the GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
+4. Authenticate with GitHub if prompted (uses VS Code's built-in GitHub authentication)
+5. The extension will:
+   - Fetch the PR's head commit
+   - Checkout the PR branch as `pr/<number>/<headOwner>/<headRefName>`
+   - Compare it against the PR's base branch
+   - Display all changes in the tree view
+
+This feature works with both PRs from the same repository and PRs from forks.
 
 ## Settings
 
