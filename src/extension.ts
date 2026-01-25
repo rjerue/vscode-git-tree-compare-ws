@@ -111,6 +111,10 @@ export function activate(context: ExtensionContext) {
         runAfterInit(() => provider!.sortByRecentlyModified());
     });
 
+    commands.registerCommand(NAMESPACE + '.openChangesWithDifftool', node => {
+        runAfterInit(() => provider!.openChangesWithDifftool(node));
+    });
+
     createGit(gitApi, outputChannel).then(async git => {
         const onOutput = (str: string) => outputChannel.append(str);
         git.onOutput.addListener('log', onOutput);
