@@ -194,7 +194,7 @@ function parseDiffIndexOutput(repoRoot: string, out: string): IDiffStatus[] {
     return entries;
 }
 
-export async function diffIndex(repo: Repository, ref: string, refreshIndex: boolean, findRenames: boolean, renameThreshold: number): Promise<IDiffStatus[]> {
+export async function diffIndex(repo: Repository, ref: string, refreshIndex: boolean, findRenames: boolean, renameThreshold: number, omitUntrackedFiles: boolean, omitUnstagedChanges: boolean): Promise<IDiffStatus[]> {
     if (refreshIndex) {
         // avoid superfluous diff entries if files only got touched
         // (see https://github.com/letmaik/vscode-git-tree-compare/issues/37)
@@ -206,16 +206,24 @@ export async function diffIndex(repo: Repository, ref: string, refreshIndex: boo
     }
 
     // exceptions can happen with newly initialized repos without commits, or when git is busy
-    const renamesFlag = findRenames ? `--find-renames=${renameThreshold}%`  : '--no-renames';
-    let diffIndexResult = await repo.exec(['diff-index', '-z', renamesFlag, ref, '--']);
-    let untrackedResult = await repo.exec(['ls-files', '-z', '--others', '--exclude-standard']);
-
     const repoRoot = normalizePath(repo.root);
-    const diffIndexStatuses = parseDiffIndexOutput(repoRoot, diffIndexResult.stdout);
+    const renamesFlag = findRenames ? `--find-renames=${renameThreshold}%`  : '--no-renames';
+    const diffIndexArgs = ['diff-index', '-z', renamesFlag];
+    if (omitUnstagedChanges) {
+        diffIndexArgs.push('--cached');
+    }
+    diffIndexArgs.push(ref, '--');
+    let diffIndexResult = await repo.exec(diffIndexArgs);
+    
+    let untrackedStatuses: IDiffStatus[] = [];
+    if (!omitUntrackedFiles) {
+        let untrackedResult = await repo.exec(['ls-files', '-z', '--others', '--exclude-standard']);
+        untrackedStatuses = untrackedResult.stdout.split('\0')
+            .slice(0, -1)
+            .map(line => new DiffStatus(repoRoot, 'U' as 'U', line, undefined, MODE_EMPTY, MODE_REGULAR_FILE));
+    }
 
-    const untrackedStatuses: IDiffStatus[] = untrackedResult.stdout.split('\0')
-        .slice(0, -1)
-        .map(line => new DiffStatus(repoRoot, 'U' as 'U', line, undefined, MODE_EMPTY, MODE_REGULAR_FILE));
+    const diffIndexStatuses = parseDiffIndexOutput(repoRoot, diffIndexResult.stdout);
 
     const untrackedAbsPaths = new Set(untrackedStatuses.map(status => status.dstAbsPath))
 
