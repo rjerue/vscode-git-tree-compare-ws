@@ -14,7 +14,7 @@ import { getDefaultBranch, getHeadModificationDate, getBranchCommit,
          diffIndex, IDiffStatus, StatusCode, getAbsGitDir,
          getWorkspaceFolders, getGitRepositoryFolders, hasUncommittedChanges, rmFile } from './gitHelper'
 import { tryDeepenForMergeBase } from './deepenHelper'
-import { debounce, throttle } from './git/decorators'
+import { throttle } from './git/decorators'
 import { normalizePath } from './fsUtils';
 import { API as GitAPI, Repository as GitAPIRepository } from './typings/git';
 import { Octokit } from '@octokit/rest';
@@ -149,6 +149,7 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     private includeFilesOutsideWorkspaceFolderRoot: boolean;
     private openChangesOnSelect: boolean;
     private autoChangeRepository: boolean;
+    private multiRepositoryView: boolean;
     private autoRefresh: boolean;
     private refreshIndex: boolean;
     private iconsMinimal: boolean;
@@ -199,6 +200,8 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     private checkboxStates: Map<string, CheckboxStateInfo> = new Map<string, CheckboxStateInfo>();
     private parentMap: Map<string, Element> = new Map();
     private elementMap: Map<string, FileElement> = new Map();
+    private pendingRefreshRepositories = new Map<string, Uri>();
+    private pendingRefreshTimer: NodeJS.Timeout | undefined;
 
     // Other
     private readonly disposables: Disposable[] = [];
@@ -296,9 +299,6 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
 
     private getCurrentRepositoryRoots(selectedFirst=false): string[] {
         const roots = getGitRepositoryFolders(this.gitApi, selectedFirst).map(normalizePath);
-        if (workspace.workspaceFolders) {
-            roots.push(...workspace.workspaceFolders.map(folder => normalizePath(folder.uri.fsPath)));
-        }
         const uniqueRoots: string[] = [];
         const seen = new Set<string>();
         for (const root of roots) {
@@ -320,8 +320,32 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
         return element?.repositoryRoot;
     }
 
+    private async ensureRepositoryForCommand(element: Element | undefined): Promise<boolean> {
+        const repositoryRoot = this.getRepositoryRootFromElement(element);
+        if (repositoryRoot) {
+            return await this.hydrateRepository(repositoryRoot);
+        }
+        if (this.repository) {
+            return true;
+        }
+        const gitRepos = this.getCurrentRepositoryRoots(true);
+        if (gitRepos.length === 1) {
+            return await this.hydrateRepository(gitRepos[0]);
+        }
+        return false;
+    }
+
     async init(treeView: TreeView<Element>) {
         this.treeView = treeView
+
+        // Use the original single-repository behavior unless multi-repo view
+        // actually has multiple repositories to display.
+        const gitRepos = this.getCurrentRepositoryRoots(true);
+        if (!this.multiRepositoryView || gitRepos.length === 1) {
+            if (gitRepos.length > 0) {
+                await this.changeRepository(gitRepos[0]);
+            }
+        }
 
         this.disposables.push(workspace.onDidChangeConfiguration(this.handleConfigChange, this));
         this.disposables.push(workspace.onDidChangeWorkspaceFolders(this.handleWorkspaceFoldersChanged, this));
@@ -358,6 +382,11 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
 
         this.disposables.push(treeView.onDidChangeCheckboxState(this.handleChangeCheckboxState, this));
         this.disposables.push(window.onDidChangeActiveTextEditor(this.handleActiveEditorChange, this));
+        this.disposables.push(new Disposable(() => {
+            if (this.pendingRefreshTimer) {
+                clearTimeout(this.pendingRefreshTimer);
+            }
+        }));
     }
 
     async setRepository(repositoryRoot: string) {
@@ -407,6 +436,19 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     }
 
     private updateTreeTitle() {
+        if (!this.multiRepositoryView) {
+            if (!this.repository) {
+                this.treeView.title = 'none';
+                return;
+            }
+            const repoName = path.basename(this.repoRoot);
+            if (this.searchFilter) {
+                this.treeView.title = `${repoName} (filtered)`;
+            } else {
+                this.treeView.title = repoName;
+            }
+            return;
+        }
         const repoCount = this.getCurrentRepositoryRoots().length;
         if (repoCount === 0) {
             this.treeView.title = 'none';
@@ -486,6 +528,10 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     }
 
     private async handleRepositoryOpened(repository: GitAPIRepository) {
+        const gitRepos = this.getCurrentRepositoryRoots(true);
+        if ((!this.multiRepositoryView || gitRepos.length === 1) && this.repository === undefined) {
+            await this.changeRepository(repository.rootUri.fsPath);
+        }
         this.fireTreeDataChange();
         this.disposables.push(repository.ui.onDidChange(() => this.handleRepositoryUiChange(repository)));
     }
@@ -507,20 +553,50 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     }
 
     private async handleWorkspaceFoldersChanged(e: WorkspaceFoldersChangeEvent) {
-        // If the folder got removed that was currently active in the diff,
-        // clear its cached state and let the tree render the remaining roots.
-        for (var removedFolder of e.removed) {
-            if (normalizePath(removedFolder.uri.fsPath) === this.workspaceFolder) {
-                const gitRepos = this.getCurrentRepositoryRoots(true);
-                if (gitRepos.length > 0) {
-                    this.repositoryStates.delete(normalizePath(removedFolder.uri.fsPath));
-                    this.fireTreeDataChange();
-                } else {
-                    await this.unsetRepository();
+        if (!this.multiRepositoryView) {
+            // If the folder got removed that was currently active in the diff,
+            // then pick an arbitrary new one.
+            for (var removedFolder of e.removed) {
+                if (normalizePath(removedFolder.uri.fsPath) === this.workspaceFolder) {
+                    const gitRepos = this.getCurrentRepositoryRoots(true);
+                    if (gitRepos.length > 0) {
+                        const newFolder = gitRepos[0];
+                        await this.changeRepository(newFolder);
+                    } else {
+                        await this.unsetRepository();
+                    }
                 }
             }
+            // If no repository is selected but new folders were added,
+            // then pick an arbitrary new one.
+            if (!this.repository && e.added) {
+                const gitRepos = this.getCurrentRepositoryRoots(true);
+                if (gitRepos.length > 0) {
+                    const newFolder = gitRepos[0];
+                    await this.changeRepository(newFolder);
+                }
+            }
+            return;
         }
-        if (!this.repository && e.added) {
+
+        let removedAnyRepository = e.removed.length > 0;
+        for (var removedFolder of e.removed) {
+            const removedRoot = normalizePath(removedFolder.uri.fsPath);
+            const resolvedRoot = this.resolveRepositoryRootAlias(removedRoot);
+            this.repositoryStates.delete(resolvedRoot);
+            this.repositoryRootAliases.delete(removedRoot);
+            this.repositoryRootAliases.delete(resolvedRoot);
+            if (resolvedRoot === this.activeRepoRoot) {
+                this.repository = undefined;
+                this.activeRepoRoot = undefined;
+            }
+        }
+        const gitRepos = this.getCurrentRepositoryRoots(true);
+        if (gitRepos.length === 0) {
+            await this.unsetRepository();
+            return;
+        }
+        if (removedAnyRepository || e.added.length > 0) {
             this.fireTreeDataChange();
         }
     }
@@ -577,6 +653,7 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
         this.includeFilesOutsideWorkspaceFolderRoot = config.get<boolean>('includeFilesOutsideWorkspaceRoot', true);
         this.openChangesOnSelect = config.get<boolean>('openChanges', true);
         this.autoChangeRepository = config.get<boolean>('autoChangeRepository', false);
+        this.multiRepositoryView = config.get<boolean>('multiRepositoryView', false);
         this.autoRefresh = config.get<boolean>('autoRefresh', true);
         this.refreshIndex = config.get<boolean>('refreshIndex', true);
         this.iconsMinimal = config.get<boolean>('iconsMinimal', false);
@@ -680,8 +757,29 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
         if (!element) {
             const gitRepos = this.getCurrentRepositoryRoots(true);
             this.updateTreeTitle();
-            return gitRepos.map(repositoryRoot =>
-                new RepositoryElement(repositoryRoot, path.basename(repositoryRoot), true));
+            if (this.multiRepositoryView && gitRepos.length > 1) {
+                return gitRepos.map(repositoryRoot =>
+                    new RepositoryElement(repositoryRoot, path.basename(repositoryRoot), true));
+            }
+            if (!this.repository) {
+                return [];
+            }
+            if (!this.filesInsideTreeRoot) {
+                try {
+                    await this.updateDiff(false);
+                } catch (e: any) {
+                    // some error occured, ignore and try again next time
+                    this.log('Ignoring updateDiff() error during initial getChildren()', e);
+                    return [];
+                }
+            }
+            const hasFiles =
+                this.filesInsideTreeRoot.size > 0 ||
+                (this.includeFilesOutsideWorkspaceFolderRoot && this.filesOutsideTreeRoot.size > 0);
+
+            const children = [new RefElement(this.repoRoot, this.baseRef, hasFiles)];
+            // RefElement is the root, no parent to record
+            return children;
         } else if (element instanceof RepositoryElement) {
             if (!await this.hydrateRepository(element.repositoryRoot)) {
                 return [];
@@ -997,14 +1095,37 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
         return false;
     }
 
-    @debounce(2000)
-    private async handleWorkspaceChange(uri: Uri) {
+    private handleWorkspaceChange(uri: Uri) {
         if (!this.autoRefresh) {
             return
         }
         const normPath = normalizePath(uri.fsPath);
         const repoRoot = this.findRepositoryRootForPath(normPath);
-        if (!repoRoot || !await this.useRepository(repoRoot)) {
+        if (!repoRoot) {
+            this.log(`Ignoring change outside of repositories: ${uri.fsPath}`)
+            return;
+        }
+        this.pendingRefreshRepositories.set(repoRoot, uri);
+        if (this.pendingRefreshTimer) {
+            clearTimeout(this.pendingRefreshTimer);
+        }
+        this.pendingRefreshTimer = setTimeout(() => {
+            this.pendingRefreshTimer = undefined;
+            this.refreshPendingRepositories();
+        }, 2000);
+    }
+
+    private async refreshPendingRepositories() {
+        const repositoryEntries = [...this.pendingRefreshRepositories.entries()];
+        this.pendingRefreshRepositories.clear();
+        for (const [repoRoot, uri] of repositoryEntries) {
+            await this.refreshRepositoryForWorkspaceChange(repoRoot, uri);
+        }
+    }
+
+    private async refreshRepositoryForWorkspaceChange(repoRoot: string, uri: Uri) {
+        const normPath = normalizePath(uri.fsPath);
+        if (!await this.useRepository(repoRoot)) {
             this.log(`Ignoring change outside of repositories: ${uri.fsPath}`)
             return;
         }
@@ -1024,7 +1145,7 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
             const onDidFocusWindowOrBecomeVisible = anyEvent<any>(onDidFocusWindow, onDidBecomeVisible);
             await eventToPromise(onDidFocusWindowOrBecomeVisible);
             this.isPaused = false;
-            this.handleWorkspaceChange(uri);
+            await this.refreshRepositoryForWorkspaceChange(repoRoot, uri);
             return;
         }
         this.log(`Relevant workspace change detected: ${uri.fsPath}`)
@@ -1063,10 +1184,12 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
         const oldOmitUntrackedFiles = this.omitUntrackedFiles;
         const oldOmitUnstagedChanges = this.omitUnstagedChanges;
         const oldSortOrder = this.sortOrder;
+        const oldMultiRepositoryView = this.multiRepositoryView;
         this.readConfig();
         if (oldTreeRootIsRepo != this.treeRootIsRepo ||
             oldInclude != this.includeFilesOutsideWorkspaceFolderRoot ||
             oldOpenChangesOnSelect != this.openChangesOnSelect ||
+            oldMultiRepositoryView != this.multiRepositoryView ||
             oldIconsMinimal != this.iconsMinimal ||
             (!oldAutoRefresh && this.autoRefresh) ||
             (!oldRefreshIndex && this.refreshIndex) ||
@@ -1079,7 +1202,27 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
             oldOmitUnstagedChanges != this.omitUnstagedChanges ||
             oldSortOrder != this.sortOrder) {
 
-            for (const repositoryRoot of this.getCurrentRepositoryRoots(true)) {
+            if (oldMultiRepositoryView != this.multiRepositoryView) {
+                this.repositoryStates.clear();
+                this.repositoryRootAliases.clear();
+                const gitRepos = this.getCurrentRepositoryRoots(true);
+                if (!this.multiRepositoryView || gitRepos.length === 1) {
+                    if (gitRepos.length > 0) {
+                        await this.changeRepository(gitRepos[0]);
+                    } else {
+                        await this.unsetRepository();
+                    }
+                    return;
+                }
+                this.fireTreeDataChange();
+                return;
+            }
+
+            const repositoriesToUpdate = this.multiRepositoryView
+                ? this.getCurrentRepositoryRoots(true)
+                : (this.repository ? [this.repoRoot] : []);
+
+            for (const repositoryRoot of repositoriesToUpdate) {
                 if (!await this.hydrateRepository(repositoryRoot)) {
                     continue;
                 }
@@ -1351,10 +1494,9 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
             left, right, filename + " (Working Tree)", options);
     }
 
-    openAllChanges(entry: RefElement | RepoRootElement | FolderElement | RepositoryElement | undefined) {
-        const repositoryRoot = this.getRepositoryRootFromElement(entry);
-        if (repositoryRoot) {
-            this.loadRepositoryState(repositoryRoot);
+    async openAllChanges(entry: RefElement | RepoRootElement | FolderElement | RepositoryElement | undefined) {
+        if (!await this.ensureRepositoryForCommand(entry)) {
+            return;
         }
         const withinFolder = entry instanceof FolderElement ? entry.dstAbsPath : undefined;
         for (const file of this.iterFiles(withinFolder)) {
@@ -1406,9 +1548,8 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     }
 
     async discardAllChanges(entry?: RefElement | RepositoryElement) {
-        const repositoryRoot = this.getRepositoryRootFromElement(entry);
-        if (repositoryRoot) {
-            this.loadRepositoryState(repositoryRoot);
+        if (!await this.ensureRepositoryForCommand(entry)) {
+            return;
         }
         const statuses = [...this.iterFiles()];
         await this.doDiscardChanges(statuses);
@@ -1520,10 +1661,9 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
         }
     }
 
-    openChangedFiles(entry: RefElement | RepoRootElement | FolderElement | RepositoryElement | undefined) {
-        const repositoryRoot = this.getRepositoryRootFromElement(entry);
-        if (repositoryRoot) {
-            this.loadRepositoryState(repositoryRoot);
+    async openChangedFiles(entry: RefElement | RepoRootElement | FolderElement | RepositoryElement | undefined) {
+        if (!await this.ensureRepositoryForCommand(entry)) {
+            return;
         }
         const withinFolder = entry instanceof FolderElement ? entry.dstAbsPath : undefined;
         for (const file of this.iterFiles(withinFolder)) {
@@ -1550,9 +1690,9 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     }
 
     async promptChangeBase(entry?: RefElement | RepositoryElement) {
-        const repositoryRoot = this.getRepositoryRootFromElement(entry);
-        if (repositoryRoot) {
-            await this.useRepository(repositoryRoot);
+        if (!await this.ensureRepositoryForCommand(entry)) {
+            window.showErrorMessage('No repository selected');
+            return;
         }
         if (!this.repository) {
             window.showErrorMessage('No repository selected');
@@ -1620,9 +1760,9 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     }
 
     async compareGitHubPullRequest(entry?: RefElement | RepositoryElement) {
-        const repositoryRoot = this.getRepositoryRootFromElement(entry);
-        if (repositoryRoot) {
-            await this.useRepository(repositoryRoot);
+        if (!await this.ensureRepositoryForCommand(entry)) {
+            window.showErrorMessage('No repository selected');
+            return;
         }
         if (!this.repository) {
             window.showErrorMessage('No repository selected');
@@ -1813,23 +1953,43 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
 
     async manualRefresh(entry?: RefElement | RepositoryElement) {
         const repositoryRoot = this.getRepositoryRootFromElement(entry);
-        if (repositoryRoot) {
-            await this.useRepository(repositoryRoot);
+        const repositoryRoots = repositoryRoot
+            ? [repositoryRoot]
+            : (this.multiRepositoryView ? this.getCurrentRepositoryRoots(true) : []);
+        if (repositoryRoots.length > 1) {
+            window.withProgress({ location: ProgressLocation.Window, title: 'Updating Tree' }, async _ => {
+                for (const repoRoot of repositoryRoots) {
+                    if (!await this.hydrateRepository(repoRoot)) {
+                        continue;
+                    }
+                    await this.refreshActiveRepository();
+                }
+                this.fireTreeDataChange();
+            });
+            return;
+        }
+        if (!await this.ensureRepositoryForCommand(entry)) {
+            window.showErrorMessage('No repository selected');
+            return;
         }
         window.withProgress({ location: ProgressLocation.Window, title: 'Updating Tree' }, async _ => {
-            try {
-                if (await this.isHeadChanged()) {
-                    // make sure merge base is updated when switching branches
-                    await this.updateRefs(this.baseRef);
-                }
-                await this.updateDiff(true);
-                this.saveRepositoryState();
-            } catch (e: any) {
-                let msg = 'Updating the git tree failed';
-                this.log(msg, e);
-                window.showErrorMessage(`${msg}: ${e.message}`);
-            }
+            await this.refreshActiveRepository();
         });
+    }
+
+    private async refreshActiveRepository() {
+        try {
+            if (await this.isHeadChanged()) {
+                // make sure merge base is updated when switching branches
+                await this.updateRefs(this.baseRef);
+            }
+            await this.updateDiff(true);
+            this.saveRepositoryState();
+        } catch (e: any) {
+            let msg = 'Updating the git tree failed';
+            this.log(msg, e);
+            window.showErrorMessage(`${msg}: ${e.message}`);
+        }
     }
 
     async switchToMergeDiff() {
@@ -1878,9 +2038,8 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     }
 
     async searchChanges(entry?: RefElement | RepositoryElement) {
-        const repositoryRoot = this.getRepositoryRootFromElement(entry);
-        if (repositoryRoot) {
-            this.loadRepositoryState(repositoryRoot);
+        if (!await this.ensureRepositoryForCommand(entry)) {
+            return;
         }
         const uris = [...this.iterFiles()].map(file => Uri.file(file.dstAbsPath));
         const relativePaths = uris.map(uri => path.relative(this.repoRoot, uri.fsPath));
@@ -1892,9 +2051,8 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     }
 
     async filterFiles(entry?: RefElement | RepositoryElement) {
-        const repositoryRoot = this.getRepositoryRootFromElement(entry);
-        if (repositoryRoot) {
-            this.loadRepositoryState(repositoryRoot);
+        if (!await this.ensureRepositoryForCommand(entry)) {
+            return;
         }
         const searchTerm = await window.showInputBox({
             prompt: 'Enter text to filter files (leave empty to show all)',
@@ -1914,10 +2072,9 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
         this.fireTreeDataChange();
     }
 
-    clearFilter(entry?: RefElement | RepositoryElement) {
-        const repositoryRoot = this.getRepositoryRootFromElement(entry);
-        if (repositoryRoot) {
-            this.loadRepositoryState(repositoryRoot);
+    async clearFilter(entry?: RefElement | RepositoryElement) {
+        if (!await this.ensureRepositoryForCommand(entry)) {
+            return;
         }
         if (!this.searchFilter) {
             return;
