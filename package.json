@@ -112,6 +112,12 @@
       },
       {
         "command": "gitTreeCompare.refresh",
+        "title": "Refresh Repository",
+        "icon": "$(refresh)",
+        "category": "Git Tree Compare"
+      },
+      {
+        "command": "gitTreeCompare.refreshAll",
         "title": "Refresh",
         "icon": "$(refresh)",
         "category": "Git Tree Compare"
@@ -286,12 +292,12 @@
           "group": "2_files"
         },
         {
-          "command": "gitTreeCompare.refresh",
+          "command": "gitTreeCompare.refreshAll",
           "when": "view == gitTreeCompare",
           "group": "1_state"
         },
         {
-          "command": "gitTreeCompare.refresh",
+          "command": "gitTreeCompare.refreshAll",
           "when": "view == gitTreeCompare",
           "group": "navigation@3"
         },

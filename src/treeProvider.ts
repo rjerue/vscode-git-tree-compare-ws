@@ -1952,10 +1952,17 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
     }
 
     async manualRefresh(entry?: RefElement | RepositoryElement) {
-        const repositoryRoot = this.getRepositoryRootFromElement(entry);
-        const repositoryRoots = repositoryRoot
-            ? [repositoryRoot]
-            : (this.multiRepositoryView ? this.getCurrentRepositoryRoots(true) : []);
+        if (!await this.ensureRepositoryForCommand(entry)) {
+            window.showErrorMessage('No repository selected');
+            return;
+        }
+        window.withProgress({ location: ProgressLocation.Window, title: 'Updating Tree' }, async _ => {
+            await this.refreshActiveRepository();
+        });
+    }
+
+    async manualRefreshAll() {
+        const repositoryRoots = this.multiRepositoryView ? this.getCurrentRepositoryRoots(true) : [];
         if (repositoryRoots.length > 1) {
             window.withProgress({ location: ProgressLocation.Window, title: 'Updating Tree' }, async _ => {
                 for (const repoRoot of repositoryRoots) {
@@ -1968,7 +1975,7 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
             });
             return;
         }
-        if (!await this.ensureRepositoryForCommand(entry)) {
+        if (!await this.ensureRepositoryForCommand(undefined)) {
             window.showErrorMessage('No repository selected');
             return;
         }

@@ -70,6 +70,11 @@ export function activate(context: ExtensionContext) {
             provider!.manualRefresh(node);
         });
     });
+    commands.registerCommand(NAMESPACE + '.refreshAll', () => {
+        runAfterInit(() => {
+            provider!.manualRefreshAll();
+        });
+    });
     commands.registerCommand(NAMESPACE + '.openAllChanges', node => {
         runAfterInit(() => provider!.openAllChanges(node));
     });
