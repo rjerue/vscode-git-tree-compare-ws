@@ -2041,8 +2041,13 @@ export class GitTreeCompareProvider implements TreeDataProvider<Element>, Dispos
         if (!await this.ensureRepositoryForCommand(entry)) {
             return;
         }
-        const uris = [...this.iterFiles()].map(file => Uri.file(file.dstAbsPath));
-        const relativePaths = uris.map(uri => path.relative(this.repoRoot, uri.fsPath));
+        const relativePaths = [...this.iterFiles()]
+            .map(file => path.relative(this.workspaceFolder, file.dstAbsPath))
+            .filter(relPath => relPath && !relPath.startsWith('..' + path.sep) && relPath !== '..');
+        if (relativePaths.length === 0) {
+            window.showInformationMessage('No changed files to search.');
+            return;
+        }
         await commands.executeCommand('workbench.action.findInFiles', {
             query: '',
             filesToInclude: relativePaths.join(','),
